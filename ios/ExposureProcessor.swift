@@ -3,7 +3,7 @@ import ExposureNotification
 import os.log
 import BackgroundTasks
 
-@available(iOS 13.5, *)
+@available(iOS 12.5, *)
 public class ExposureProcessor {  
     public struct ExposureInfo: Codable {
         let daysSinceLastExposure: Int
@@ -11,21 +11,32 @@ public class ExposureProcessor {
         let matchedKeyCount: Int
         let maxRiskScore: Int
         let exposureDate: Date
+        let exposureContactDate: Date
         var maximumRiskScoreFullRange: Int!
         var riskScoreSumFullRange: Int!
         var customAttenuationDurations: [Int]!
-        var details: [ExposureDetails]!
+        var windows: [ExposureDetailsWindow]!
     }
-    public struct ExposureDetails: Codable {
+    public struct ExposureScanData: Codable {
+        var buckets: [Int]
+        var weightedBuckets: [Int]!
+        var exceedsThreshold: Bool
+        var numScans: Int
+    }
+    public struct ExposureDetailsWindow: Codable {
         let date: Date
-        let duration: TimeInterval
-        let totalRiskScore: ENRiskScore
-        let transmissionRiskLevel: ENRiskLevel
-        let attenuationDurations: [Int]
-        let attenuationValue: ENAttenuation
-        //metadata
+        let calibrationConfidence: UInt8
+        let diagnosisReportType: UInt32
+        let infectiousness: UInt32
+        var scanData: ExposureScanData
     }
-  
+    
+    public enum SupportedENAPIVersion {
+        case version2
+        case version1
+        case unsupported
+    }
+
     private let backgroundName = Bundle.main.bundleIdentifier! + ".exposure-notification"
     
     static public let shared = ExposureProcessor()
@@ -38,8 +49,19 @@ public class ExposureProcessor {
     deinit {
         self.keyValueObservers.removeAll()
     }
+
+    public func getSupportedExposureNotificationsVersion() -> SupportedENAPIVersion {
+        if #available(iOS 13.7, *) {
+            return .version2
+        } else if #available(iOS 13.5, *) {
+            return .version1
+        } else if ExposureNotificationModule.ENManagerIsAvailable() {
+            return .version2
+        } else {
+            return .unsupported
+        }
+    }
     
-  
     public func authoriseExposure(_ resolve: @escaping RCTPromiseResolveBlock,
                                   rejecter reject: @escaping RCTPromiseRejectBlock) {
         ExposureManager.shared.manager.setExposureNotificationEnabled(true) { error in
@@ -77,6 +99,7 @@ public class ExposureProcessor {
     public func status(_ resolve: @escaping RCTPromiseResolveBlock,
                     rejecter reject: RCTPromiseRejectBlock) {
       var result: [String: Any] = [:]
+      result["type"] = [""]
       switch ExposureManager.shared.manager.exposureNotificationStatus {
         case .active:
             result["state"] = "active"
@@ -93,6 +116,9 @@ public class ExposureProcessor {
         case .paused:
             result["state"] = "disabled"
             result["type"] = ["paused"]
+        case .unauthorized:
+            result["state"] = "disabled"
+            result["type"] = ["unauthorized"]            
         default:
             result["state"] = "unavailable"
             result["type"] = ["starting"]
@@ -118,6 +144,7 @@ public class ExposureProcessor {
         }
         let context = Storage.PersistentContainer.shared.newBackgroundContext()
         Storage.shared.flagPauseStatus(context, false)
+        Storage.shared.flagStopped(context, false)
         ExposureManager.shared.manager.setExposureNotificationEnabled(true) { error in
             if let error = error as? ENError {
                 os_log("Error starting notification services, %@", log: OSLog.exposure, type: .error, error.localizedDescription)
@@ -161,6 +188,7 @@ public class ExposureProcessor {
         }
         let context = Storage.PersistentContainer.shared.newBackgroundContext()
         Storage.shared.flagPauseStatus(context, false)
+        Storage.shared.flagStopped(context, true)
         ExposureManager.shared.manager.setExposureNotificationEnabled(false) { error in
             if let error = error as? ENError {
               os_log("Error stopping notification services, %@", log: OSLog.setup, type: .error, error.localizedDescription)
@@ -220,6 +248,40 @@ public class ExposureProcessor {
       
     }
   
+    public func getConfigData(_ resolve: @escaping RCTPromiseResolveBlock,
+                           rejecter reject: @escaping RCTPromiseRejectBlock) {
+      let context = Storage.PersistentContainer.shared.newBackgroundContext()
+      guard let config = Storage.shared.readSettings(context) else {
+        return resolve([])
+      }
+      var data:[String: Any] = [:]
+      data["token"] = config.authToken
+      data["refreshToken"] = config.refreshToken
+      data["serverURL"] = config.serverURL
+      data["keyServerURL"] = config.keyServerUrl
+      data["serverType"] = config.keyServerType.rawValue
+      data["analyticsOptin"] = config.analyticsOptin
+      data["keychainGetError"] = config.lastKeyChainGetError
+      data["keychainSetError"] = config.lastKeyChainSetError
+      data["lastExposureIndex"] = config.lastExposureIndex
+        
+      let formatter = DateFormatter()
+      formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+      
+      if let when = config.lastUpdated {
+        data["lastUpdated"] = formatter.string(from: when)
+      } else {
+        data["lastUpdated"] = "Not updated"
+      }
+      if let ran = config.lastRunDate {
+        data["lastRunDate"] = formatter.string(from: ran)
+      } else {
+        data["lastRunDate"] = "Not run"
+      }
+      resolve(data)
+      
+    }
+
     public func getCloseContacts(_ resolve: @escaping RCTPromiseResolveBlock,
                                   rejecter reject: @escaping RCTPromiseRejectBlock) {
        
@@ -237,21 +299,23 @@ public class ExposureProcessor {
            "maxRiskScore": exposure.maxRiskScore,
            "attenuationDurations": exposure.attenuationDurations,
            "exposureAlertDate": Int64(exposure.exposureDate.timeIntervalSince1970 * 1000.0),
-           "maximumRiskScoreFullRange": exposure.maximumRiskScoreFullRange ?? 0,
+           "exposureDate": Int64(exposure.exposureContactDate.timeIntervalSince1970 * 1000.0),
+           "maxRiskScoreFullRange": exposure.maximumRiskScoreFullRange ?? 0,
            "riskScoreSumFullRange": exposure.riskScoreSumFullRange ?? 0,
-           "customAttenuationDurations": exposure.customAttenuationDurations ?? []
          ]
-         if let details = exposure.details {
-           let extraInfo = details.compactMap { detail -> [String: Any]? in
-            return ["date": Int64(detail.date.timeIntervalSince1970 * 1000.0),
-                     "duration": detail.duration,
-                     "totalRiskScore": detail.totalRiskScore,
-                     "attenuationValue": detail.attenuationValue,
-                     "attenuationDurations": detail.attenuationDurations,
-                     "transmissionRiskLevel": detail.transmissionRiskLevel
+         if let windows = exposure.windows {
+           let windowInfo = windows.compactMap { window -> [String: Any]? in
+            return ["date": Int64(window.date.timeIntervalSince1970 * 1000.0),
+                    "calibrationConfidence": window.calibrationConfidence,
+                    "diagnosisReportType": window.diagnosisReportType,
+                    "infectiousness": window.infectiousness,
+                    "buckets": window.scanData.buckets,
+                    "weightedBuckets": window.scanData.weightedBuckets,
+                    "numScans": window.scanData.numScans,
+                    "exceedsThreshold": window.scanData.exceedsThreshold
              ]
            }
-           item["details"] = extraInfo
+           item["windows"] = windowInfo
          }
          return item
        }
@@ -272,21 +336,23 @@ public class ExposureProcessor {
     }
   
     public func registerBackgroundProcessing() {
-        BGTaskScheduler.shared.register(
-            forTaskWithIdentifier: self.backgroundName,
-            using: .main) { task in
-                ExposureProcessor.shared.checkExposureBackground(task as! BGProcessingTask)
+        if #available(iOS 13.5, *) {
+            BGTaskScheduler.shared.register(
+                forTaskWithIdentifier: self.backgroundName,
+                using: .main) { task in
+                    ExposureProcessor.shared.checkExposureBackground(task as! BGProcessingTask)
+            }
+            os_log("Registering background task", log: OSLog.exposure, type: .debug)
         }
-        os_log("Registering background task", log: OSLog.exposure, type: .debug)
-        
         self.scheduleCheckExposure()
     }
     
+    @available(iOS 13.5, *)
     private func checkExposureBackground(_ task: BGTask) {
        os_log("Running exposure check in background", log: OSLog.exposure, type: .debug)
        let queue = OperationQueue()
        queue.maxConcurrentOperationCount = 1
-       queue.addOperation(ExposureCheck(false, false, false))
+       queue.addOperation(ExposureCheck(false, false, 0))
 
        task.expirationHandler = {
           os_log("Background task expiring", log: OSLog.checkExposure, type: .debug)
@@ -302,11 +368,11 @@ public class ExposureProcessor {
        }
     }
     
-    public func checkExposureForeground(_ exposureDetails: Bool, _ skipTimeCheck: Bool, _ simulateExposure: Bool) {
+    public func checkExposureForeground(_ skipTimeCheck: Bool, _ simulateExposure: Bool, _ simulateDays: Int) {
        os_log("Running exposure check in foreground", log: OSLog.exposure, type: .debug)
        let queue = OperationQueue()
        queue.maxConcurrentOperationCount = 1
-       queue.addOperation(ExposureCheck(skipTimeCheck, exposureDetails, simulateExposure))
+       queue.addOperation(ExposureCheck(skipTimeCheck, simulateExposure, simulateDays))
 
        let lastOperation = queue.operations.last
        lastOperation?.completionBlock = {
@@ -317,14 +383,18 @@ public class ExposureProcessor {
     private func scheduleCheckExposure() {
       let context = Storage.PersistentContainer.shared.newBackgroundContext()
       
-      do {
-          let request = BGProcessingTaskRequest(identifier: self.backgroundName)
-          request.requiresNetworkConnectivity = true
-          try BGTaskScheduler.shared.submit(request)
-          os_log("Scheduling background exposure check", log: OSLog.setup, type: .debug)
-      } catch {
-          os_log("An error occurred scheduling background task, %@", log: OSLog.setup, type: .error, error.localizedDescription)
-          Storage.shared.updateRunData(context, "An error occurred scheduling the background task, \(error.localizedDescription)")
+      if #available(iOS 13.5, *) {
+          do {
+              let request = BGProcessingTaskRequest(identifier: self.backgroundName)
+              request.requiresNetworkConnectivity = true
+              try BGTaskScheduler.shared.submit(request)
+              os_log("Scheduling background exposure check", log: OSLog.setup, type: .debug)
+          } catch {
+              os_log("An error occurred scheduling background task, %@", log: OSLog.setup, type: .error, error.localizedDescription)
+              Storage.shared.updateRunData(context, "An error occurred scheduling the background task, \(error.localizedDescription)")
+          }
+      } else if ExposureNotificationModule.ENManagerIsAvailable() {
+        ExposureManager.shared.launchBackgroundiOS12()
       }
     }
     

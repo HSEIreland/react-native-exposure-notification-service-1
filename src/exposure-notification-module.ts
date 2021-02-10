@@ -22,24 +22,39 @@ export interface ConfigurationOptions {
   authToken: string;
   refreshToken: string;
   storeExposuresFor: number;
-  fileLimit: number;
   notificationTitle: string;
   notificationDesc: string;
   callbackNumber: string;
   analyticsOptin: boolean;
+  notificationRepeat: number;
+  certList: string;
 }
 
 export interface DiagnosisKey {
   keyData: string;
 }
 
+export interface WindowData {
+  date: number;
+  calibrationConfidence: number;
+  diagnosisReportType: number;
+  infectiousness: number;
+  buckets: number[];
+  weightedBuckets: number[];
+  numScans: number;
+  exceedsThreshold: boolean;
+}
+
 export interface CloseContact {
-  exposureAlertDate: string;
+  exposureAlertDate: number;
+  exposureDate: number;
   attenuationDurations: number[];
   daysSinceLastExposure: number;
   matchedKeyCount: number;
   maxRiskScore: number;
-  summationRiskScore: number;
+  riskScoreSumFullRange: number;
+  maxRiskScoreFullRange: number;
+  windows?: WindowData[];
 }
 
 export enum StatusState {
@@ -55,7 +70,8 @@ export enum StatusType {
   exposure = 'exposure',
   resolution = 'resolution',
   paused = 'paused',
-  starting = 'starting'
+  starting = 'starting',
+  stopped = 'stopped'
 }
 
 export interface Status {
@@ -88,9 +104,9 @@ export interface ExposureNotificationModule extends EventSubscriptionVendor {
 
   getDiagnosisKeys(): Promise<DiagnosisKey[]>;
 
-  checkExposure(readDetails?: boolean, skipTimeCheck?: boolean): void;
+  checkExposure(skipTimeCheck?: boolean): void;
 
-  simulateExposure(timeDelay?: number): void;
+  simulateExposure(timeDelay: number, exposureDays: number): void;
 
   getCloseContacts(): Promise<CloseContact[]>;
 
@@ -98,9 +114,13 @@ export interface ExposureNotificationModule extends EventSubscriptionVendor {
 
   getLogData(): Promise<any>;
 
+  getConfigData(): Promise<any>;
+
   version(): Promise<Version>;
 
   bundleId(): Promise<string>;
+
+  cancelNotifications(): void;
 
   /**
    * @platform android

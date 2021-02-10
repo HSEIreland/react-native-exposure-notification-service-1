@@ -9,7 +9,6 @@ import React, {
 import {
   NativeEventEmitter,
   Alert,
-  Platform,
   AppState,
   AppStateStatus
 } from 'react-native';
@@ -48,20 +47,21 @@ export interface ExposureContextValue extends State {
   stop: () => void;
   pause: () => Promise<boolean>;
   configure: () => void;
-  checkExposure: (readDetails: boolean, skipTimeCheck: boolean) => void;
-  simulateExposure: (timeDelay: number) => void;
+  checkExposure: (skipTimeCheck: boolean) => void;
+  simulateExposure: (timeDelay: number, exposureDays: number) => void;
   getDiagnosisKeys: () => Promise<any[]>;
   exposureEnabled: () => Promise<boolean>;
   authoriseExposure: () => Promise<boolean>;
   deleteAllData: () => Promise<void>;
   supportsExposureApi: () => Promise<void>;
-  getCloseContacts: () => Promise<CloseContact[] | null>;
+  getCloseContacts: () => Promise<CloseContact[]>;
   getLogData: () => Promise<{[key: string]: any}>;
   triggerUpdate: () => Promise<string | undefined>;
   deleteExposureData: () => Promise<void>;
   readPermissions: () => Promise<void>;
   askPermissions: () => Promise<void>;
   setExposureState: (setStateAction: SetStateAction<State>) => void;
+  cancelNotifications: () => void;
 }
 
 const initialState = {
@@ -100,7 +100,8 @@ export const ExposureContext = createContext<ExposureContextValue>({
   deleteExposureData: () => Promise.resolve(),
   readPermissions: () => Promise.resolve(),
   askPermissions: () => Promise.resolve(),
-  setExposureState: () => {}
+  setExposureState: () => {},
+  cancelNotifications: () => {}
 });
 
 export interface ExposureProviderProps {
@@ -115,6 +116,8 @@ export interface ExposureProviderProps {
   notificationDescription: string;
   callbackNumber?: string;
   analyticsOptin?: boolean;
+  notificationRepeat?: number;
+  certList?: string;
 }
 
 export const getVersion = async () => {
@@ -135,6 +138,15 @@ export const getBundleId = async () => {
   }
 };
 
+export const getConfigData = async () => {
+  try {
+    const result = await ExposureNotification.getConfigData();
+    return result;
+  } catch (e) {
+    console.log('getConfigData error', e);
+  }
+};
+
 export const ExposureProvider: React.FC<ExposureProviderProps> = ({
   children,
   isReady = false,
@@ -147,7 +159,9 @@ export const ExposureProvider: React.FC<ExposureProviderProps> = ({
   notificationTitle,
   notificationDescription,
   callbackNumber = '',
-  analyticsOptin = false
+  analyticsOptin = false,
+  notificationRepeat = 0,
+  certList = ''
 }) => {
   const [state, setState] = useState<State>(initialState);
 
@@ -192,14 +206,22 @@ export const ExposureProvider: React.FC<ExposureProviderProps> = ({
         const latestStatus = await ExposureNotification.status();
 
         if (
-          !(latestStatus && latestStatus.type?.indexOf(StatusType.paused) > -1)
+          !(
+            latestStatus &&
+            (latestStatus.type?.indexOf(StatusType.paused) > -1 ||
+              latestStatus.type?.indexOf(StatusType.stopped) > -1)
+          )
         ) {
           start();
         }
       }
     }
     checkSupportAndStart();
-  }, [state.permissions, isReady]);
+  }, [
+    state.permissions.exposure.status,
+    state.permissions.notifications.status,
+    isReady
+  ]);
 
   const supportsExposureApi = async function () {
     const can = await ExposureNotification.canSupport();
@@ -276,11 +298,6 @@ export const ExposureProvider: React.FC<ExposureProviderProps> = ({
 
   const configure = async () => {
     try {
-      const iosLimit =
-        traceConfiguration.fileLimitiOS > 0
-          ? traceConfiguration.fileLimitiOS
-          : traceConfiguration.fileLimit;
-
       const config = {
         exposureCheckFrequency: traceConfiguration.exposureCheckInterval,
         serverURL: serverUrl,
@@ -289,14 +306,13 @@ export const ExposureProvider: React.FC<ExposureProviderProps> = ({
         authToken,
         refreshToken,
         storeExposuresFor: traceConfiguration.storeExposuresFor,
-        fileLimit:
-          Platform.OS === 'ios' ? iosLimit : traceConfiguration.fileLimit,
         notificationTitle,
         notificationDesc: notificationDescription,
         callbackNumber,
-        analyticsOptin
+        analyticsOptin,
+        notificationRepeat,
+        certList
       };
-
       await ExposureNotification.configure(config);
 
       return true;
@@ -306,12 +322,12 @@ export const ExposureProvider: React.FC<ExposureProviderProps> = ({
     }
   };
 
-  const checkExposure = (readDetails: boolean, skipTimeCheck: boolean) => {
-    ExposureNotification.checkExposure(readDetails, skipTimeCheck);
+  const checkExposure = (skipTimeCheck: boolean) => {
+    ExposureNotification.checkExposure(skipTimeCheck);
   };
 
-  const simulateExposure = (timeDelay: number) => {
-    ExposureNotification.simulateExposure(timeDelay);
+  const simulateExposure = (timeDelay: number, exposureDays: number) => {
+    ExposureNotification.simulateExposure(timeDelay, exposureDays);
   };
 
   const getDiagnosisKeys = () => {
@@ -378,6 +394,14 @@ export const ExposureProvider: React.FC<ExposureProviderProps> = ({
     }
   };
 
+  const cancelNotifications = async () => {
+    try {
+      ExposureNotification.cancelNotifications();
+    } catch (e) {
+      console.log('cancel notifications exposure data error', e);
+    }
+  };
+
   const readPermissions = useCallback(async () => {
     console.log('Read permissions...');
 
@@ -417,7 +441,8 @@ export const ExposureProvider: React.FC<ExposureProviderProps> = ({
     deleteExposureData,
     readPermissions,
     askPermissions,
-    setExposureState: setState
+    setExposureState: setState,
+    cancelNotifications
   };
 
   return (

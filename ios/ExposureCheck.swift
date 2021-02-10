@@ -4,8 +4,11 @@ import ExposureNotification
 import SSZipArchive
 import Alamofire
 
-@available(iOS 13.5, *)
+@available(iOS 12.5, *)
 class ExposureCheck: AsyncOperation {
+    public static let REPEAT_NOTIFICATION_ID = "repeatExposure"
+    public static let INITIAL_NOTIFICATION_ID = "exposure"
+      
     public enum endPoints {
         case metrics
         case exposures
@@ -15,6 +18,13 @@ class ExposureCheck: AsyncOperation {
         case refresh
     }
   
+    public struct Thresholds {
+      let thresholdWeightings: [Double]
+      let timeThreshold: Int
+      let numFiles: Int
+      let contiguousMode: Bool
+    }
+    
     private struct CodableSettings: Decodable {
       let exposureConfig: String
     }
@@ -32,11 +42,24 @@ class ExposureCheck: AsyncOperation {
         let durationAtAttenuationThresholds: [Int]
         let thresholdWeightings: [Double]
         let timeThreshold: Int
-    }
-  
-    private struct Thresholds {
-      let thresholdWeightings: [Double]
-      let timeThreshold: Int
+        let numFilesiOS: Int?
+        let immediateDurationWeight: Double?
+        let nearDurationWeight: Double?
+        let mediumDurationWeight: Double?
+        let otherDurationWeight: Double?
+        let infectiousnessStandardWeight: Double?
+        let infectiousnessHighWeight: Double?
+        let reportTypeConfirmedTestWeight: Double?
+        let reportTypeConfirmedClinicalDiagnosisWeight: Double?
+        let reportTypeSelfReportedWeight: Double?
+        let reportTypeRecursiveWeight: Double?
+        let reportTypeNoneMap: UInt32?
+        let daysSinceLastExposureThreshold: Int?
+        let minimumRiskScoreFullRange: Double?
+        let infectiousnessForDaysSinceOnsetOfSymptoms: [Int]?
+        let attenuationDurationThresholds: [Int]?
+        let v2Mode: Bool?
+        let contiguousMode: Bool?
     }
   
     private struct CodableExposureFiles: Codable {
@@ -81,18 +104,18 @@ class ExposureCheck: AsyncOperation {
     private let defaultSession = URLSession(configuration: .default)
     private var dataTask: URLSessionDataTask?
     private var configData: Storage.Config!
-    private var readExposureDetails: Bool = false
     private var skipTimeCheck: Bool = false
     private var simulateExposureOnly: Bool = false
+    private var simulateExposureDays: Int = 2
     private let storageContext = Storage.PersistentContainer.shared.newBackgroundContext()
     private var sessionManager: Session!
     
-    init(_ skipTimeCheck: Bool, _ accessDetails: Bool, _ simulateExposureOnly: Bool) {
+    init(_ skipTimeCheck: Bool, _ simulateExposureOnly: Bool, _ simulateDays: Int) {
         super.init()
     
         self.skipTimeCheck = skipTimeCheck
-        self.readExposureDetails = accessDetails
         self.simulateExposureOnly = simulateExposureOnly
+        self.simulateExposureDays = simulateDays
     }
     
     override func cancel() {
@@ -100,16 +123,16 @@ class ExposureCheck: AsyncOperation {
     }
        
     override func main() {
-      self.configData = Storage.shared.readSettings(self.storageContext)
+       self.configData = Storage.shared.readSettings(self.storageContext)
        guard self.configData != nil else {
-          self.finishNoProcessing("No config set so can't proceeed with checking exposures", false)
+          self.finishNoProcessing("No config set so can't proceed with checking exposures", false)
           return
        }
-      
+ 
        let serverDomain: String = Storage.getDomain(self.configData.serverURL)
        let keyServerDomain: String = Storage.getDomain(self.configData.keyServerUrl)
        var manager: ServerTrustManager
-       if (self.configData.keyServerType != Storage.KeyServerType.NearForm) {
+       if (self.configData.keyServerType != Storage.KeyServerType.NearForm && serverDomain != keyServerDomain) {
           manager = ServerTrustManager(evaluators: [serverDomain: PinnedCertificatesTrustEvaluator(), keyServerDomain: DefaultTrustEvaluator()])
        } else {
           manager = ServerTrustManager(evaluators: [serverDomain: PinnedCertificatesTrustEvaluator()])
@@ -117,13 +140,13 @@ class ExposureCheck: AsyncOperation {
        self.sessionManager = Session(interceptor: RequestInterceptor(self.configData, self.serverURL(.refresh)), serverTrustManager: manager)
         
        os_log("Running with params %@, %@, %@", log: OSLog.checkExposure, type: .debug, self.configData.serverURL, self.configData.authToken, self.configData.refreshToken)
-       
-       guard (self.configData.lastRunDate!.addingTimeInterval(TimeInterval(self.configData.checkExposureInterval * 60)) < Date() || self.skipTimeCheck) else {
+               
+       /*guard (self.configData.lastRunDate!.addingTimeInterval(TimeInterval(self.configData.checkExposureInterval * 60)) < Date() || self.skipTimeCheck) else {
             let formatter = DateFormatter()
             formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
             self.finishNoProcessing("Check was run at \(formatter.string(from: self.configData.lastRunDate!)), interval is \(self.configData.checkExposureInterval), its too soon to check again", false)
             return
-       }
+       }*/
 
        guard ENManager.authorizationStatus == .authorized else {
             self.finishNoProcessing("Not authorised so can't run exposure checks")
@@ -140,38 +163,52 @@ class ExposureCheck: AsyncOperation {
         
        if (self.simulateExposureOnly) {
            os_log("Simulating exposure alert", log: OSLog.exposure, type: .debug)
-           simulateExposureEvent()
+           simulateExposureEvent(self.simulateExposureDays)
            return
        }
         
        os_log("Starting exposure checking", log: OSLog.exposure, type: .debug)
 
-       getExposureFiles { result in
+       self.getExposureConfiguration { result in
             switch result {
               case let .failure(error):
-                 self.finishNoProcessing("Failed to retrieve exposure files for processing, \(error.localizedDescription)")
-              case let .success((urls, lastIndex)):
-                if urls.count > 0 {
-                  self.processExposures(urls, lastIndex)
-                }
-                else {
-                  self.finishNoProcessing("No files available to process", false)
-                }
+                 self.finishNoProcessing("Failed to retrieve settings, \(error.localizedDescription)")
+              case let .success((configuration, thresholds, v2Mode)):
+                self.processExposureFiles(configuration, thresholds, v2Mode)
             }
        }
     }
     
-    private func simulateExposureEvent() {
-        var info = ExposureProcessor.ExposureInfo(daysSinceLastExposure: 2, attenuationDurations: [30, 30, 30], matchedKeyCount: 1,  maxRiskScore: 10, exposureDate: Date())
+    private func processExposureFiles(_ configuration: ENExposureConfiguration, _ thresholds: Thresholds, _ v2Mode: Bool) {
+        
+        self.getExposureFiles(thresholds.numFiles) { fileResult in
+            switch fileResult {
+                case let .success((urls, lastIndex)):
+                    if urls.count > 0 {
+                      self.processExposures(urls, lastIndex, configuration, thresholds, v2Mode)
+                    }
+                    else {
+                      self.finishNoProcessing("No files available to process", false)
+                    }
+                case let .failure(error):
+                    self.finishNoProcessing("Failed to retrieve exposure files for processing, \(error.localizedDescription)")
+            }
+        }
+    }
+    
+    private func simulateExposureEvent(_ simulateDays: Int) {
+        let calendar = Calendar.current
+        let dateToday = calendar.startOfDay(for: Date())
+        let contactDate = calendar.date(byAdding: .day, value: (0 - simulateDays), to: dateToday)
+
+        var info = ExposureProcessor.ExposureInfo(daysSinceLastExposure: simulateDays, attenuationDurations: [30, 30, 30], matchedKeyCount: 1,  maxRiskScore: 10, exposureDate: Date(), exposureContactDate: contactDate!)
       
         info.maximumRiskScoreFullRange = 10
         info.riskScoreSumFullRange = 10
         info.customAttenuationDurations = [30, 30, 30]
                 
-        let thresholds = Thresholds(thresholdWeightings: [1,1,0], timeThreshold: 15)
-
         let lastId = self.configData.lastExposureIndex!
-        return self.finishProcessing(.success((info, lastId, thresholds)))
+        return self.finishProcessing(.success((info, lastId)))
     }
 
     private func getDomain(_ url: String) -> String {
@@ -196,69 +233,57 @@ class ExposureCheck: AsyncOperation {
       }
     }
   
-    private func processExposures(_ files: [URL], _ lastIndex: Int) {
-      getExposureConfiguration() { result in
-        switch result {
-           case let .success((configuration, thresholds)):
-            os_log("We have files and config, %d, %@", log: OSLog.checkExposure, type: .debug, files.count, files[0].absoluteString)
-               ExposureManager.shared.manager.detectExposures(configuration: configuration, diagnosisKeyURLs: files) { summary, error in
-                   self.deleteLocalFiles(files)
-                   if let error = error {
-                    return self.finishProcessing(.failure(self.wrapError("Failure in detectExposures", error)))
-                   }
-                
-                   guard let summaryData = summary else {
-                      os_log("No summary data returned", log: OSLog.checkExposure, type: .debug)
-                      return self.finishProcessing(.success((nil, lastIndex, thresholds)))
-                   }
-                
-                   var info = ExposureProcessor.ExposureInfo(daysSinceLastExposure: summaryData.daysSinceLastExposure, attenuationDurations: self.convertDurations(summaryData.attenuationDurations), matchedKeyCount: Int(summaryData.matchedKeyCount),  maxRiskScore: Int(summaryData.maximumRiskScore), exposureDate: Date())
-                
-                   if let meta = summaryData.metadata {
-                       info.maximumRiskScoreFullRange = meta["maximumRiskScoreFullRange"] as? Int
-                       info.riskScoreSumFullRange = meta["riskScoreSumFullRange"] as? Int
-                       info.customAttenuationDurations = self.convertDurations(meta["attenuationDurations"] as? [NSNumber])
-                   }
-                
-                   os_log("Success in checking exposures, %d, %d, %d, %d, %d", log: OSLog.checkExposure, type: .debug, info.daysSinceLastExposure, info.matchedKeyCount, info.attenuationDurations.count,
-                       info.maxRiskScore, self.readExposureDetails)
-                   
-                   if info.matchedKeyCount > 0 && !self.readExposureDetails {
-                      return self.finishProcessing(.success((info, lastIndex, thresholds)))
-                   }
-                   os_log("Reading exposure details, only used in test", log: OSLog.checkExposure, type: .debug)
-                   
-                   let userExplanation = "To help with testing we are requesting more detailed information on the exposure event."
-                   ExposureManager.shared.manager.getExposureInfo(summary: summary!, userExplanation: userExplanation) { exposures, error in
-                           if let error = error {
-                            self.finishProcessing(.failure(self.wrapError("Error calling getExposureInfo", error)))
-                              return
-                           }
-                           let exposureData = exposures!.map { exposure in
-                              ExposureProcessor.ExposureDetails(date: exposure.date,
-                                        duration: exposure.duration,
-                                        totalRiskScore: exposure.totalRiskScore,
-                                        transmissionRiskLevel: exposure.transmissionRiskLevel,
-                                        attenuationDurations: self.convertDurations(exposure.attenuationDurations),
-                                        attenuationValue: exposure.attenuationValue)
-                           }
-                           info.details = exposureData
-                           self.finishProcessing(.success((info, lastIndex, thresholds)))
-                   }
-                  
-               }
-               
-            case let .failure(error):
-              self.finishNoProcessing("Failed to extract settings, \(error.localizedDescription)")
-         }
-      }
+    private func processExposures(_ files: [URL], _ lastIndex: Int, _ configuration: ENExposureConfiguration, _ thresholds: Thresholds, _ v2Mode: Bool) {
+       
+        os_log("Checking exposures against %d files", log: OSLog.checkExposure, type: .info, files.count)
+        
+        ExposureManager.shared.manager.detectExposures(configuration: configuration, diagnosisKeyURLs: files) { summary, error in
+           
+           self.deleteLocalFiles(files)
+           if let error = error {
+              return self.finishProcessing(.failure(self.wrapError("Failure in detectExposures", error)))
+           }
+            
+           guard let summaryData = summary else {
+              os_log("No summary data returned", log: OSLog.checkExposure, type: .debug)
+              return self.finishProcessing(.success((nil, lastIndex)))
+           }
+        
+           if ExposureProcessor.shared.getSupportedExposureNotificationsVersion() == .version2, v2Mode {
+                RiskCalculationV2.calculateRisk(summaryData, configuration, thresholds) { result in
+                    switch result {
+                        case let .success(exposureInfo):
+                            return self.finishProcessing(.success((exposureInfo, lastIndex)))
+                        case let .failure(error):
+                            self.finishProcessing((.failure(error)))
+                    }
+                 }
+           } else if #available(iOS 13.5, *) {
+                 RiskCalculationV1.calculateRisk(summaryData, thresholds) { result in
+                    switch result {
+                        case let .success(exposureInfo):
+                            return self.finishProcessing(.success((exposureInfo, lastIndex)))
+                    case let .failure(error):
+                        self.finishProcessing((.failure(error)))
+                    }
+
+                 }
+           } else {
+               os_log("Config not set for v2, iOS12 only supports V2", log: OSLog.checkExposure, type: .info)
+               return self.finishProcessing(.success((nil, lastIndex)))
+           }
+        }
     }
+
+    
+    private func wrapError(_ description: String, _ error: Error?) -> Error {
       
-    private func wrapError(_ description: String, _ error: Error) -> Error {
-      let err = error as NSError
-      
-      return NSError(domain: err.domain, code: err.code, userInfo: [NSLocalizedDescriptionKey: "\(description), \(error.localizedDescription)"])
-      
+      if let err = error {
+        let nsErr = err as NSError
+        return NSError(domain: nsErr.domain, code: nsErr.code, userInfo: [NSLocalizedDescriptionKey: "\(description), \(nsErr.localizedDescription)"])
+      } else {
+        return NSError(domain: "exposurecheck", code: 500, userInfo: [NSLocalizedDescriptionKey: "\(description)"])
+      }
     }
   
     private func deleteLocalFiles(_ files:[URL]) {
@@ -267,47 +292,30 @@ class ExposureCheck: AsyncOperation {
       }
     }
   
-    private func convertDurations(_ durations: [NSNumber]?) -> [Int] {
-      let empty: [NSNumber] = []
-      
-      return (durations ?? empty).compactMap { item in
-        Int(item.doubleValue / 60.0)
-      }
-    }
-  
-    private func finishProcessing(_ result: Result<(ExposureProcessor.ExposureInfo?, Int, Thresholds), Error>) {
+
+    private func finishProcessing(_ result: Result<(ExposureProcessor.ExposureInfo?, Int), Error>) {
       switch result {
-      case let .success((exposureData, lastFileIndex, thresholds)):
+      case let .success((exposureData, lastFileIndex)):
           os_log("We successfully completed checks", log: OSLog.checkExposure, type: .info)
           Storage.shared.updateRunData(self.storageContext, "", lastFileIndex)
   
-          guard let exposures = exposureData, exposures.matchedKeyCount > 0 else {
-            os_log("No keys matched, no exposures detected", log: OSLog.checkExposure, type: .debug)
-            return self.trackDailyMetrics()
-          }
-          
-          let durations:[Int] = exposures.customAttenuationDurations ?? exposures.attenuationDurations
-          
-          guard thresholds.thresholdWeightings.count >= durations.count else {
-            return self.finishNoProcessing("Failure processing exposure keys, thresholds not correctly defined");
-          }
-          
-          var contactTime = 0
-          for (index, element) in durations.enumerated() {
-            contactTime += Int(Double(element) * thresholds.thresholdWeightings[index])
-          }
-          
-          os_log("Calculated contact time, %@, %d, %d", log: OSLog.checkExposure, type: .debug, durations.map { String($0) }, contactTime, thresholds.timeThreshold)
-          
-          if contactTime >= thresholds.timeThreshold && exposures.maximumRiskScoreFullRange > 0 {
-             os_log("Detected exposure event", log: OSLog.checkExposure, type: .info)
-             Storage.shared.saveExposureDetails(self.storageContext, exposures)
+        
+          if let exposure = exposureData  {
+             let existingExposures = Storage.shared.getExposures(self.configData.storeExposuresFor).reversed()
             
-             self.triggerUserNotification(exposures) { _ in
-               self.trackDailyMetrics()
+             if (existingExposures.count > 0 && existingExposures.first!.exposureContactDate < exposure.exposureContactDate) || existingExposures.count == 0 {
+                os_log("Detected exposure event", log: OSLog.checkExposure, type: .info)
+                Storage.shared.saveExposureDetails(self.storageContext, exposure)
+            
+                self.triggerUserNotification(exposure) { _ in
+                    self.trackDailyMetrics()
+                }
+             } else {
+                os_log("Exposure detected but not more recent then currently recorded exposures", log: OSLog.checkExposure, type: .info)
+                self.trackDailyMetrics()
              }
           } else {
-            os_log("Exposures outside thresholds", log: OSLog.checkExposure, type: .info)
+            os_log("No exposure detected", log: OSLog.checkExposure, type: .info)
             self.trackDailyMetrics()
           }
       case let .failure(error):
@@ -339,27 +347,28 @@ class ExposureCheck: AsyncOperation {
       
     }
 
-    private func getExposureFiles(_ completion: @escaping  (Result<([URL], Int), Error>) -> Void) {
+    private func getExposureFiles(_ numFiles: Int, completion: @escaping  (Result<([URL], Int), Error>) -> Void) {
       guard !self.isCancelled else {
         return self.cancelProcessing()
       }
       os_log("Key server type set to %@", log: OSLog.checkExposure, type: .debug, self.configData.keyServerType.rawValue)
       switch self.configData.keyServerType {
       case .GoogleRefServer:
-        getGoogleExposureFiles(completion)
+        getGoogleExposureFiles(numFiles, completion)
       default:
-        getNearFormExposureFiles(completion)
+        getNearFormExposureFiles(numFiles, completion)
       }
     }
 
-    private func getNearFormExposureFiles(_ completion: @escaping  (Result<([URL], Int), Error>) -> Void) {
+    private func getNearFormExposureFiles(_ numFiles: Int, _ completion: @escaping  (Result<([URL], Int), Error>) -> Void) {
       guard !self.isCancelled else {
         return self.cancelProcessing()
       }
 
       let lastId = self.configData.lastExposureIndex ?? 0
-      os_log("Checking for exposures against nearform server since %d", log: OSLog.checkExposure, type: .debug, lastId)
-      self.sessionManager.request(self.serverURL(.exposures), parameters: ["since": lastId, "limit": self.configData.fileLimit])
+      let version = Storage.shared.version()["display"] ?? "unknown"
+      os_log("Checking for exposures against nearform server since %d, limit %d", log: OSLog.checkExposure, type: .debug, lastId, numFiles)
+        self.sessionManager.request(self.serverURL(.exposures), parameters: ["since": lastId, "limit": numFiles, "version": version, "os": "ios"])
       .validate()
       .responseDecodable(of: [CodableExposureFiles].self) { response in
         switch response.result {
@@ -372,7 +381,7 @@ class ExposureCheck: AsyncOperation {
       }
     }
 
-    private func getGoogleExposureFiles(_ completion: @escaping  (Result<([URL], Int), Error>) -> Void) {
+    private func getGoogleExposureFiles(_ numFiles: Int, _ completion: @escaping  (Result<([URL], Int), Error>) -> Void) {
       guard !self.isCancelled else {
         return self.cancelProcessing()
       }
@@ -383,7 +392,7 @@ class ExposureCheck: AsyncOperation {
         .responseString { response in
           switch response.result {
           case .success:
-            let files = self.findFilesToProcess(response.value!)
+            let files = self.findFilesToProcess(numFiles, response.value!)
 
             self.processFileLinks(files, completion)
           case let .failure(error):
@@ -418,7 +427,7 @@ class ExposureCheck: AsyncOperation {
         }
     }
     
-    private func findFilesToProcess(_ fileList: String) -> [CodableExposureFiles] {
+    private func findFilesToProcess(_ numFiles:Int, _ fileList: String) -> [CodableExposureFiles] {
         /// fileList if of format
         /*
          v1/1597846020-1597846080-00001.zip
@@ -440,9 +449,9 @@ class ExposureCheck: AsyncOperation {
             }
         }
         if (self.configData.lastExposureIndex <= 0) {
-            return Array(filesToProcess.suffix(self.configData.fileLimit))
+            return Array(filesToProcess.suffix(numFiles))
         } else {
-            return Array(filesToProcess.prefix(self.configData.fileLimit))
+            return Array(filesToProcess.prefix(numFiles))
         }
     }
     
@@ -463,78 +472,113 @@ class ExposureCheck: AsyncOperation {
     }
     
     private func downloadFilesForProcessing(_ files: [URL], _ completion: @escaping (Result<[URL], Error>) -> Void) {
+      
       guard !self.isCancelled else {
         return self.cancelProcessing()
       }
       
-      var processedFiles: Int = 0
       var validFiles: [URL] = []
-      
+      var errorDetails: [Error] = []
+
+      let taskGroup = DispatchGroup()
+      let queue = DispatchQueue(label: "ENSWorkerQueuer")
+        
       let downloadData: [FileDownloadTracking] = files.enumerated().compactMap { (index, file) in
         let local = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!.appendingPathComponent("diagnosisZip-\(index)")
         let unzipPath = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!.appendingPathComponent("diagnosisKeys-\(index)", isDirectory: true)
         return FileDownloadTracking(remoteURL: file, localURL: local, unzipPath: unzipPath)
       }
       
-      func downloadComplete(_ path: String, _ succeeded: Bool, _ error: Error?) {
-        if  error != nil {
-          os_log("Error unzipping keys file, %@", log: OSLog.checkExposure, type: .error, error!.localizedDescription)
-        }
-        os_log("Keys file successfully unzipped, %@, %d", log: OSLog.checkExposure, type: .debug, path, succeeded)
-      }
-      
       downloadData.enumerated().forEach { (index, item) in
-        self.downloadURL(item.remoteURL, item.localURL) { result in
-          switch result {
-          case let .success(url):
-            do {
-              if item.remoteURL.path.hasSuffix(".zip") {
-                try? FileManager.default.createDirectory(at: item.unzipPath, withIntermediateDirectories: false, attributes: nil)
-                let success = SSZipArchive.unzipFile(atPath: url.path, toDestination: item.unzipPath.path, progressHandler: nil, completionHandler: downloadComplete)
-                if success {
-                  let fileURLs = try FileManager.default.contentsOfDirectory(at: item.unzipPath, includingPropertiesForKeys: nil)
-                  for (file) in fileURLs.enumerated() {
-                    var renamePath: URL!
-                    if file.element.path.hasSuffix(".sig") {
-                      renamePath = item.unzipPath.appendingPathComponent("export\(index).sig")
-                    } else if file.element.path.hasSuffix(".bin") {
-                      renamePath = item.unzipPath.appendingPathComponent("export\(index).bin")
+        taskGroup.enter()
+        queue.async(group: taskGroup) {
+            self.downloadURL(item.remoteURL, item.localURL) { result in
+              switch result {
+              case let .success(url):
+                  if item.remoteURL.path.hasSuffix(".zip") {
+                    do {
+                        let extractedFiles = try self.unzipFile(index, url, item)
+                        if extractedFiles.count > 0 {
+                            os_log("Adding files to list, %d", log: OSLog.checkExposure, type: .debug, extractedFiles.count)
+                            validFiles.append(contentsOf: extractedFiles)
+                        }
+                    } catch {
+                       os_log("Error unzipping, %@", log: OSLog.checkExposure, type: .error, error.localizedDescription)
+                        errorDetails.append(self.wrapError("Error unzipping file \(item.remoteURL.path)", error))
                     }
-                    if renamePath != nil {
-                      try? FileManager.default.moveItem(at: file.element, to: renamePath)
-                      validFiles.append(renamePath)
-                    }
+                    /// remove the zip
+                    try? FileManager.default.removeItem(at: url)
+
+                  } else {
+                    /// not a zip, used during testing
+                    validFiles.append(url)
                   }
-                }
-                /// remove the zip
-                try? FileManager.default.removeItem(at: url)
-              } else {
-                /// not a zip, used during testing
-                validFiles.append(url)
-              }
-              processedFiles += 1
-            } catch {
-              try? FileManager.default.removeItem(at: url)
-              os_log("Error unzipping, %@", log: OSLog.checkExposure, type: .error, error.localizedDescription)
-              processedFiles += 1
+                  
+              case let .failure(error):
+                try? FileManager.default.removeItem(at: item.localURL)
+                
+                os_log("Failed to download the file %@, %@", log: OSLog.checkExposure, type: .error, item.remoteURL.absoluteString, error.localizedDescription)
+                errorDetails.append(self.wrapError("Failed to download the file \(item.remoteURL.path)", error))
+                
             }
-          case let .failure(error):
-            try? FileManager.default.removeItem(at: item.localURL)
-            
-            os_log("Failed to download the file %@, %@", log: OSLog.checkExposure, type: .error, item.remoteURL.absoluteString, error.localizedDescription)
-            processedFiles += 1
+            taskGroup.leave()
           }
-          if processedFiles == downloadData.count {
-            if validFiles.count > 0 {
-              completion(.success(validFiles))
-            } else {
-              completion(.failure(NSError(domain:"download", code: 400, userInfo:nil)))
-            }
-          }
+          
+        }
+      }
+        
+      //Notify when all task completed at main thread queue.
+        taskGroup.notify(queue: queue) {
+        // All tasks are done.
+        if validFiles.count > 0 {
+          completion(.success(validFiles))
+        } else {
+          let errorData = self.flattenError(errorDetails)
+          completion(.failure(self.wrapError("Error downloading files: \(errorData)", nil)))
         }
       }
     }
   
+    private func flattenError(_ errors: [Error]) -> String {
+        var errText = ""
+        
+        for err in errors {
+            errText = err.localizedDescription + "\n"
+        }
+        
+        return errText
+    }
+    
+    private func unzipFile(_ index: Int, _ url: URL, _ item: FileDownloadTracking) throws -> [URL] {
+        var renamedFiles: [URL] = []
+        
+        try? FileManager.default.createDirectory(at: item.unzipPath, withIntermediateDirectories: false, attributes: nil)
+        let success = SSZipArchive.unzipFile(atPath: url.path, toDestination: item.unzipPath.path, progressHandler: nil, completionHandler: downloadComplete)
+        if success {
+          let fileURLs = try FileManager.default.contentsOfDirectory(at: item.unzipPath, includingPropertiesForKeys: nil)
+          for (file) in fileURLs.enumerated() {
+            var renamePath: URL!
+            if file.element.path.hasSuffix(".sig") {
+              renamePath = item.unzipPath.appendingPathComponent("export\(index).sig")
+            } else if file.element.path.hasSuffix(".bin") {
+              renamePath = item.unzipPath.appendingPathComponent("export\(index).bin")
+            }
+            if renamePath != nil {
+              try? FileManager.default.moveItem(at: file.element, to: renamePath)
+              renamedFiles.append(renamePath)
+            }
+          }
+        }
+        return renamedFiles
+    }
+    
+    private func downloadComplete(_ path: String, _ succeeded: Bool, _ error: Error?) {
+      if  error != nil {
+        os_log("Error unzipping keys file, %@", log: OSLog.checkExposure, type: .error, error!.localizedDescription)
+      }
+      os_log("Keys file successfully unzipped, %@, %d", log: OSLog.checkExposure, type: .debug, path, succeeded)
+    }
+    
     private func cancelProcessing() {
       Storage.shared.updateRunData(self.storageContext, "Background processing expiring, cancelling")
       self.finish()
@@ -567,12 +611,12 @@ class ExposureCheck: AsyncOperation {
       }
     }
   
-    private func getExposureConfiguration(_ completion: @escaping  (Result<(ENExposureConfiguration, Thresholds), Error>) -> Void) {
+    private func getExposureConfiguration(_ completion: @escaping  (Result<(ENExposureConfiguration, Thresholds, Bool), Error>) -> Void) {
       guard !self.isCancelled else {
         return self.cancelProcessing()
       }
-      
-      self.sessionManager.request(self.serverURL(.settings))
+      let version = Storage.shared.version()["display"] ?? "unknown"
+        self.sessionManager.request(self.serverURL(.settings), parameters: ["version": version, "os": "ios"])
           .validate()
           .responseDecodable(of: CodableSettings.self) { response in
           
@@ -583,6 +627,8 @@ class ExposureCheck: AsyncOperation {
                 let codableExposureConfiguration = try JSONDecoder().decode(CodableExposureConfiguration.self, from: exposureData.exposureConfig.data(using: .utf8)!)
                 let exposureConfiguration = ENExposureConfiguration()
                 
+                let thresholds = Thresholds(thresholdWeightings: codableExposureConfiguration.thresholdWeightings, timeThreshold: codableExposureConfiguration.timeThreshold, numFiles: codableExposureConfiguration.numFilesiOS ?? 6, contiguousMode: codableExposureConfiguration.contiguousMode ?? false)
+
                 exposureConfiguration.minimumRiskScore = codableExposureConfiguration.minimumRiskScore
                 exposureConfiguration.attenuationLevelValues = codableExposureConfiguration.attenuationLevelValues as [NSNumber]
                 exposureConfiguration.attenuationWeight = codableExposureConfiguration.attenuationWeight
@@ -596,9 +642,38 @@ class ExposureCheck: AsyncOperation {
                 let meta:[AnyHashable: Any] = [AnyHashable("attenuationDurationThresholds"): codableExposureConfiguration.durationAtAttenuationThresholds as [NSNumber]]
                 exposureConfiguration.metadata = meta
                 
-                let thresholds = Thresholds(thresholdWeightings: codableExposureConfiguration.thresholdWeightings, timeThreshold: codableExposureConfiguration.timeThreshold)
+                let v2Mode = codableExposureConfiguration.v2Mode ?? false
+                if ExposureProcessor.shared.getSupportedExposureNotificationsVersion() == .version2, v2Mode == true {
+                    exposureConfiguration.immediateDurationWeight =  codableExposureConfiguration.immediateDurationWeight ?? 100.0
+                    exposureConfiguration.nearDurationWeight =  codableExposureConfiguration.nearDurationWeight ?? 100.0
+                    exposureConfiguration.mediumDurationWeight =  codableExposureConfiguration.mediumDurationWeight ?? 100.0
+                    exposureConfiguration.otherDurationWeight =  codableExposureConfiguration.otherDurationWeight ?? 100.0
+
+                    exposureConfiguration.infectiousnessStandardWeight =  codableExposureConfiguration.infectiousnessStandardWeight ?? 100.0
+                    exposureConfiguration.infectiousnessHighWeight =   codableExposureConfiguration.infectiousnessHighWeight ?? 100.0
+                  
+                    exposureConfiguration.reportTypeConfirmedTestWeight =  codableExposureConfiguration.reportTypeConfirmedTestWeight ?? 100.0
+                    exposureConfiguration.reportTypeConfirmedClinicalDiagnosisWeight =  codableExposureConfiguration.reportTypeConfirmedClinicalDiagnosisWeight ?? 100.0
+                    exposureConfiguration.reportTypeSelfReportedWeight =  codableExposureConfiguration.reportTypeSelfReportedWeight ?? 100.0
+                    exposureConfiguration.reportTypeRecursiveWeight =  codableExposureConfiguration.reportTypeRecursiveWeight ?? 100.0
+
+                    exposureConfiguration.daysSinceLastExposureThreshold =  codableExposureConfiguration.daysSinceLastExposureThreshold ?? 0
+
+                    exposureConfiguration.minimumRiskScoreFullRange =  codableExposureConfiguration.minimumRiskScoreFullRange ?? 1
+
+                    if let data = codableExposureConfiguration.attenuationDurationThresholds {
+                        exposureConfiguration.attenuationDurationThresholds = data as [NSNumber]
+                    }
                 
-                completion(.success((exposureConfiguration, thresholds)))
+                    if let data = codableExposureConfiguration.infectiousnessForDaysSinceOnsetOfSymptoms {
+                        exposureConfiguration.infectiousnessForDaysSinceOnsetOfSymptoms = self.convertToMap(data)
+                    }
+                    
+                    exposureConfiguration.reportTypeNoneMap = ENDiagnosisReportType(rawValue:  codableExposureConfiguration.reportTypeNoneMap ?? ENDiagnosisReportType.confirmedTest.rawValue) ?? ENDiagnosisReportType.confirmedTest
+ 
+                }
+                
+                completion(.success((exposureConfiguration, thresholds, v2Mode)))
               } catch {
                 os_log("Unable to decode settings data, %@", log: OSLog.checkExposure, type: .error, error.localizedDescription)
                 completion(.failure(error))
@@ -611,6 +686,22 @@ class ExposureCheck: AsyncOperation {
        }
     }
     
+    private func convertToMap(_ daysSinceOnsetToInfectiousness: [Int]) -> [NSNumber : NSNumber] {
+        var map: [Int: Int] = [:]
+        var counter = 0
+        
+        for index in -14...14 {
+            if counter < daysSinceOnsetToInfectiousness.count {
+                map[index] = daysSinceOnsetToInfectiousness[counter]
+            } else {
+                map[index] = Int(ENInfectiousness.none.rawValue)
+            }
+            counter += 1
+        }
+        
+        return map as [NSNumber : NSNumber]
+    }
+
     private func triggerUserNotification(_ exposures: ExposureProcessor.ExposureInfo, _ completion: @escaping  (Result<Bool, Error>) -> Void) {
       let content = UNMutableNotificationContent()
       let calendar = Calendar.current
@@ -620,59 +711,81 @@ class ExposureCheck: AsyncOperation {
       content.body = self.configData.notificationDesc
       content.badge = 1
       content.sound = .default
-      let request = UNNotificationRequest(identifier: "exposure", content: content, trigger: nil)
-      UNUserNotificationCenter.current().add(request) { error in
-          DispatchQueue.main.async {
-              if let error = error {
-                os_log("Notification error %@", log: OSLog.checkExposure, type: .error, error.localizedDescription)
-              }
-          }
+              
+      let initialRequest = UNNotificationRequest(identifier: ExposureCheck.INITIAL_NOTIFICATION_ID, content: content, trigger: nil)
+      UNUserNotificationCenter.current().add(initialRequest) { error in
+            DispatchQueue.main.async {
+                if let error = error {
+                  os_log("Notification error %@", log: OSLog.checkExposure, type: .error, error.localizedDescription)
+                }
+                if (self.configData.notificationRepeat > 0) {
+                    let trigger = UNTimeIntervalNotificationTrigger(timeInterval: TimeInterval(self.configData.notificationRepeat * 60), repeats: true)
+                    let request = UNNotificationRequest(identifier: ExposureCheck.REPEAT_NOTIFICATION_ID, content: content, trigger: trigger)
+                    UNUserNotificationCenter.current().add(request) { error in
+                        DispatchQueue.main.async {
+                            if let error = error {
+                              os_log("Repeat Notification error %@", log: OSLog.checkExposure, type: .error, error.localizedDescription)
+                            }
+                        }
+                    }
+                }
+            }
       }
     
-      let payload:[String: Any] = [
+      var payload:[String: Any] = [
         "matchedKeys": exposures.matchedKeyCount,
         "attenuations": exposures.customAttenuationDurations ?? exposures.attenuationDurations,
-        "maxRiskScore": exposures.maxRiskScore
+        "maxRiskScore": exposures.maxRiskScore,
+        "daysSinceExposure": exposures.daysSinceLastExposure,
+        "simulate": simulateExposureOnly,
+        "os": "ios",
+        "version": Storage.shared.version()["display"] ?? "unknown"
       ]
+        
+      if let windowData = exposures.windows {
+          let windowInfo = windowData.compactMap { window -> [String: Any]? in
+           return ["date": Int64(window.date.timeIntervalSince1970 * 1000.0),
+                   "calibrationConfidence": window.calibrationConfidence,
+                   "diagnosisReportType": window.diagnosisReportType,
+                   "infectiousness": window.infectiousness,
+                   "buckets": window.scanData.buckets,
+                   "weightedBuckets": window.scanData.weightedBuckets!,
+                   "exceedsThreshold": window.scanData.exceedsThreshold
+            ]
+          }
+          payload["windows"] = windowInfo
+      }
       self.saveMetric(event: "CONTACT_NOTIFICATION", payload: payload) { _ in
         let lastExposure = calendar.date(byAdding: .day, value: (0 - exposures.daysSinceLastExposure), to: dateToday)
-        self.triggerCallBack(lastExposure!, payload, completion)
+        self.triggerCallBack(lastExposure!, exposures.daysSinceLastExposure, payload, completion)
       }
-      
     }
   
-  private func triggerCallBack(_ lastExposure: Date, _ payload: [String: Any], _ completion: @escaping  (Result<Bool, Error>) -> Void) {
-    guard !self.isCancelled else {
-      return self.cancelProcessing()
-    }
-    
-    guard let callbackNum = self.configData.callbackNumber, !callbackNum.isEmpty else {
-      os_log("No callback number configured", log: OSLog.checkExposure, type: .info)
-      return completion(.success(true))
-    }
-   
-    let notificationRaised = self.configData.notificationRaised
-    
-    guard !(notificationRaised ?? false) else {
-      os_log("Callback number already sent to server", log: OSLog.checkExposure, type: .info)
-      return completion(.success(true))
-    }
-    
-    self.sessionManager.request(self.serverURL(.callback), method: .post , parameters: ["mobile": callbackNum, "closeContactDate": Int64(lastExposure.timeIntervalSince1970 * 1000.0), "payload": payload], encoding: JSONEncoding.default)
-      .validate()
-      .response() { response in
-        switch response.result {
-        case .success:
-          os_log("Request for callback sent", log: OSLog.checkExposure, type: .debug)
-          Storage.shared.flagNotificationRaised(self.storageContext)
-          completion(.success(true))
-        case let .failure(error):
-          os_log("Unable to send callback request, %@", log: OSLog.checkExposure, type: .error, error.localizedDescription)
-          completion(.failure(error))
+    private func triggerCallBack(_ lastExposure: Date, _ daysSinceExposure: Int, _ payload: [String: Any], _ completion: @escaping  (Result<Bool, Error>) -> Void) {
+      guard !self.isCancelled else {
+        return self.cancelProcessing()
+      }
+      
+      guard let callbackNum = self.configData.callbackNumber, !callbackNum.isEmpty else {
+        os_log("No callback number configured", log: OSLog.checkExposure, type: .info)
+        return completion(.success(true))
+      }
+           
+      let version = Storage.shared.version()["display"] ?? "unknown"
+        self.sessionManager.request(self.serverURL(.callback), method: .post , parameters: ["mobile": callbackNum, "closeContactDate": Int64(lastExposure.timeIntervalSince1970 * 1000.0), "daysSinceExposure": daysSinceExposure, "payload": payload, "version": version, "os": "ios"], encoding: JSONEncoding.default)
+        .validate()
+        .response() { response in
+          switch response.result {
+          case .success:
+            os_log("Request for callback sent", log: OSLog.checkExposure, type: .debug)
+            completion(.success(true))
+          case let .failure(error):
+            os_log("Unable to send callback request, %@", log: OSLog.checkExposure, type: .error, error.localizedDescription)
+            completion(.failure(error))
         }
-    }
+      }
     
-  }
+    }
 
   private func saveMetric(event: String, completion: @escaping  (Result<Bool, Error>) -> Void) {
     self.saveMetric(event: event, payload: nil, completion: completion)
@@ -683,10 +796,15 @@ class ExposureCheck: AsyncOperation {
       return self.cancelProcessing()
     }
     guard self.configData != nil else {
-      // don't track daily trace if config not setup
+      // don'trun if config not setup
       return completion(.success(true))
     }
-
+    
+    guard self.sessionManager != nil else {
+      // don't run if session manager not setup
+      return completion(.success(true))
+    }
+    
     if (!self.configData.analyticsOptin) {
       os_log("Metric opt out", log: OSLog.exposure, type: .error)
       return completion(.success(true))
@@ -769,7 +887,7 @@ class RequestInterceptor: Alamofire.RequestInterceptor {
         switch response.result {
          case .success:
              self.config.authToken = response.value!.token
-             Storage.shared.updateAppSettings(self.config)
+             Storage.shared.updateAuthToken(self.config.authToken)
              completion(.success(true))
          case let .failure(error):
              completion(.failure(error))

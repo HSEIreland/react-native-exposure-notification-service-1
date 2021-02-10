@@ -3,13 +3,12 @@ package ie.gov.tracing.nearby;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
-import android.app.PendingIntent;
 import android.content.Context;
 import android.os.Build;
 
-import android.content.Context;
 import androidx.annotation.NonNull;
 import androidx.annotation.RequiresApi;
+import androidx.work.Data;
 import androidx.core.app.NotificationCompat;
 import androidx.work.Constraints;
 import androidx.work.ExistingPeriodicWorkPolicy;
@@ -35,14 +34,16 @@ import java.util.Arrays;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.List;
-import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
 import org.threeten.bp.Duration;
 import static android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION;
 
 import ie.gov.tracing.Tracing;
 import ie.gov.tracing.common.AppExecutors;
 import ie.gov.tracing.common.Events;
+import ie.gov.tracing.common.ExposureConfig;
 import ie.gov.tracing.common.TaskToFutureAdapter;
 import ie.gov.tracing.network.DiagnosisKeyDownloader;
 import ie.gov.tracing.network.Fetcher;
@@ -52,13 +53,15 @@ import ie.gov.tracing.storage.TokenEntity;
 import ie.gov.tracing.R;
 
 public class ProvideDiagnosisKeysWorker extends ListenableWorker {
-  static final Duration DEFAULT_API_TIMEOUT = Duration.ofSeconds(15);
+  public static final Duration DEFAULT_API_TIMEOUT = Duration.ofSeconds(15);
 
   private static final String WORKER_NAME = "ProvideDiagnosisKeysWorker";
   private static final BaseEncoding BASE64_LOWER = BaseEncoding.base64();
   private static final int RANDOM_TOKEN_BYTE_LENGTH = 32;
-  private static final String FOREGROUND_NOTIFICATION_ID =
+  private static final String FOREGROUND_NOTIFICATION_ID_LEGACY =
           "ProvideDiagnosisKeysWorker.FOREGROUND_NOTIFICATION_ID";
+  private static final String FOREGROUND_NOTIFICATION_ID =
+          "ProvideDiagnosisKeysWorker.FOREGROUND_NOTIFICATION_ID.noBadge";
 
   private final DiagnosisKeyDownloader diagnosisKeys;
   private final DiagnosisKeyFileSubmitter submitter;
@@ -87,7 +90,7 @@ public class ProvideDiagnosisKeysWorker extends ListenableWorker {
   private void deleteOldData() {
     try {
       long DAY_IN_MS = 1000 * 60 * 60 * 24;
-      long storeExposuresFor = SharedPrefs.getLong("storeExposuresFor", this.getApplicationContext());
+      long storeExposuresFor = SharedPrefs.getLong("storeExposuresFor", Tracing.currentContext);
       long daysBeforeNowInMs = System.currentTimeMillis() - storeExposuresFor * DAY_IN_MS;
       Events.raiseEvent(Events.INFO, "deleteOldData - delete exposures/tokens before: " +
               new Date(daysBeforeNowInMs));
@@ -101,7 +104,7 @@ public class ProvideDiagnosisKeysWorker extends ListenableWorker {
 
   private void updateLastRun() {
     try {
-      String [] lastRun = SharedPrefs.getString("lastRun", Tracing.currentContext).split("\\s*,\\s*");
+      String [] lastRun = SharedPrefs.getString("lastRun", this.context).split("\\s*,\\s*");
 
       List<String> lastRuns = new ArrayList<>(Arrays.asList(lastRun));
 
@@ -114,7 +117,8 @@ public class ProvideDiagnosisKeysWorker extends ListenableWorker {
         newLastRun += "," + lastRuns.get(i).trim();
       }
 
-      SharedPrefs.setString("lastRun", newLastRun, Tracing.currentContext);
+      SharedPrefs.setString("lastRun", newLastRun, this.context);
+      SharedPrefs.setLong("lastRunDate", System.currentTimeMillis(), this.context);
     } catch(Exception ex) {
       Events.raiseError("lastRun",  ex);
     }
@@ -123,59 +127,101 @@ public class ProvideDiagnosisKeysWorker extends ListenableWorker {
   @NonNull
   @Override
   public ListenableFuture<Result> startWork() {
-      Tracing.currentContext = getApplicationContext();
-      Events.raiseEvent(Events.INFO, "ProvideDiagnosisKeysWorker.startWork");
-
-      setForegroundAsync(createForegroundInfo());
-
-      updateLastRun();
-
-      SharedPrefs.remove("lastApiError", Tracing.currentContext);
-      SharedPrefs.remove("lastError", Tracing.currentContext);
-
-      // validate config set before running
-      final String auth = SharedPrefs.getString("authToken", this.getApplicationContext());
-      if (auth.isEmpty()) {
-        // config not yet populated so don't run
-        return Futures.immediateFailedFuture(new ConfigNotSetException());
+      try {
+        setForegroundAsync(createForegroundInfo()).get();
       }
-
-      final Boolean paused = SharedPrefs.getBoolean("servicePaused", this.getApplicationContext());
-      if (paused) {
-        // ENS is paused
-        return Futures.immediateFailedFuture(new ENSPaused());
+      catch(Exception ex) {
+          Events.raiseError("ProvideDiagnosisKeysWorker - startWork-foreground", ex);
       }
+      try {
+        Tracing.currentContext = this.context;
+        Events.raiseEvent(Events.INFO, "ProvideDiagnosisKeysWorker.startWork");
+        SharedPrefs.remove("lastApiError", this.context);
+        SharedPrefs.remove("lastError", this.context);
+        final boolean skipTimeCheck = getInputData().getBoolean("skipTimeCheck", false);
+  
+        /*long lastRun = SharedPrefs.getLong("lastRunDate", Tracing.currentContext);
+        long checkFrequency = SharedPrefs.getLong("exposureCheckFrequency", Tracing.context);
+        if (checkFrequency == 0) {
+          checkFrequency = 180;
+        }
+        if (!skipTimeCheck && (lastRun + (checkFrequency * 60)) < (System.currentTimeMillis() / 1000)) {
+          String ran = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(lastRun);
+          SharedPrefs.setString("lastError", String.format("Check was run at %s, interval is %s, its too soon to check again", ran, checkFrequency), Tracing.currentContext);
+          return Futures.immediateFailedFuture(new TooSoonToRun());
+        }
+        */
 
-      deleteOldData();
+        updateLastRun();
 
-      final String token = generateRandomToken();
-      return FluentFuture.from(TaskToFutureAdapter
-              .getFutureWithTimeout(
-                      ExposureNotificationClientWrapper.get(getApplicationContext()).isEnabled(),
-                      DEFAULT_API_TIMEOUT.toMillis(),
-                      TimeUnit.MILLISECONDS,
-                      AppExecutors.getScheduledExecutor()))
-              .transformAsync(isEnabled -> {
-                // Only continue if it is enabled.
-                if (isEnabled != null && isEnabled) {
-                  return diagnosisKeys.download();
-                } else {
-                  // Stop here because things aren't enabled. Will still return successful though.
-                  return Futures.immediateFailedFuture(new NotEnabledException());
-                }
-              },
-                      AppExecutors.getBackgroundExecutor())
-              .transformAsync(files -> submitter.parseFiles(files, token),
-                      AppExecutors.getBackgroundExecutor())
-              .transformAsync(done -> repository.upsertTokenEntityAsync(TokenEntity.create(token, false)),
-                      AppExecutors.getBackgroundExecutor())
-              .transform(done -> processSuccess(), // all done, do tidy ups here
-                      AppExecutors.getLightweightExecutor())
-              .catching(NotEnabledException.class,
-                      ex -> Result.success(), // not enabled, just return success
-                      AppExecutors.getBackgroundExecutor())
-              .catching(Exception.class, this::processFailure,
-                      AppExecutors.getBackgroundExecutor());
+        // validate config set before running
+        final String server = SharedPrefs.getString("serverUrl", this.context);
+        if (server.isEmpty()) {
+          // config not yet populated so don't run
+          SharedPrefs.setString("lastError", "No config set so can't proceed with checking exposures", this.context);
+          Events.raiseEvent(Events.INFO, "No config set so can't proceed with checking exposures");
+          return Futures.immediateFuture(Result.success());
+        }
+
+        saveDailyMetric();
+
+        final Boolean paused = SharedPrefs.getBoolean("servicePaused", this.context);
+        if (paused) {
+          // ENS is paused
+          SharedPrefs.setString("lastError", "ENS is paused", this.context);
+          Events.raiseEvent(Events.INFO, "ENS Paused");
+          return Futures.immediateFuture(Result.success());
+        }
+
+        deleteOldData();
+
+        final String token = generateRandomToken();
+        AtomicReference<ExposureConfig> ensConfig = new AtomicReference<>();
+
+        return FluentFuture.from(TaskToFutureAdapter
+                .getFutureWithTimeout(
+                        ExposureNotificationClientWrapper.get(this.context).isEnabled(),
+                        DEFAULT_API_TIMEOUT.toMillis(),
+                        TimeUnit.MILLISECONDS,
+                        AppExecutors.getScheduledExecutor()))
+                .transformAsync(isEnabled -> {
+                          // Only continue if it is enabled.
+                          if (isEnabled != null && isEnabled) {
+                            return ExposureNotificationClientWrapper.get(this.context).fetchExposureConfig(this.context);
+                          } else {
+                            // Stop here because things aren't enabled. Will still return successful though.
+                            SharedPrefs.setString("lastError", "Not authorised so can't run exposure checks", this.context);
+                            Events.raiseEvent(Events.INFO, "Not authorised so can't run exposure checks");
+                            return Futures.immediateFailedFuture(new NotEnabledException());
+                          }
+                        },
+                        AppExecutors.getBackgroundExecutor())
+                .transformAsync(config -> {
+                          ensConfig.set(config);
+                          return diagnosisKeys.download(config.getNumFilesAndroid());
+                        },
+                        AppExecutors.getBackgroundExecutor())
+                .transformAsync(files -> submitter.parseFiles(files, token, ensConfig.get()),
+                        AppExecutors.getBackgroundExecutor())
+                .transformAsync(done -> repository.upsertTokenEntityAsync(TokenEntity.create(token, false)),
+                        AppExecutors.getBackgroundExecutor())
+                .transform(done -> processSuccess(), // all done, do tidy ups here
+                        AppExecutors.getLightweightExecutor())
+                .catching(NotEnabledException.class,
+                        ex -> {
+                          SharedPrefs.setString("lastError", "Not authorised so can't run exposure checks", this.context);
+                          Events.raiseEvent(Events.INFO, "Not authorised so can't run exposure checks");
+                          return Result.success(); // not enabled, just return success
+                        },
+                        AppExecutors.getBackgroundExecutor())
+                .catching(Exception.class, this::processFailure,
+                        AppExecutors.getBackgroundExecutor());
+      } catch(Exception ex) {
+        SharedPrefs.setString("lastError", "ProvideDiagnosisKeysWorker - startWork - " + ex.getLocalizedMessage(), this.context);
+        Events.raiseError("ProvideDiagnosisKeysWorker - startWork", ex);
+        
+        return Futures.immediateFuture(Result.success());
+      }
   }
 
   @NonNull
@@ -189,6 +235,7 @@ public class ProvideDiagnosisKeysWorker extends ListenableWorker {
               .setProgress(1, 0, true)
               .setSmallIcon(R.mipmap.ic_notification)
               .setOngoing(true)
+              .setNumber(0)
               .build();
 
       return new ForegroundInfo(1, notification, FOREGROUND_SERVICE_TYPE_LOCATION);
@@ -201,19 +248,21 @@ public class ProvideDiagnosisKeysWorker extends ListenableWorker {
             id,
             this.context.getString(R.string.notification_channel_name), NotificationManager.IMPORTANCE_LOW
     );
+    channel.setShowBadge(false);
     NotificationManager notificationManager = (NotificationManager) this.context.getSystemService(
             Context.NOTIFICATION_SERVICE
     );
     notificationManager.createNotificationChannel(channel);
+    notificationManager.deleteNotificationChannel(FOREGROUND_NOTIFICATION_ID_LEGACY);
   }
 
   private Result processFailure(Exception ex) {
     HashMap<String, Object> payload = new HashMap<>();
     payload.put("description", "error processing file: " + ex);
-    Fetcher.saveMetric("LOG_ERROR", context, payload);
+    Fetcher.saveMetric("LOG_ERROR", this.context, payload);
 
     Events.raiseError("error processing file: ",  ex);
-    return Result.failure();
+    return Result.success();
   }
 
   private void deleteExports() {
@@ -239,7 +288,7 @@ public class ProvideDiagnosisKeysWorker extends ListenableWorker {
 
   private void saveDailyMetric() {
     try {
-      long dailyActiveTrace = SharedPrefs.getLong("dailyActiveTrace", this.getApplicationContext());
+      long dailyActiveTrace = SharedPrefs.getLong("dailyActiveTrace", this.context);
 
       Events.raiseEvent(Events.INFO, "saveDailyMetric - last DAILY_ACTIVE_TRACE: " + dailyActiveTrace);
 
@@ -247,18 +296,17 @@ public class ProvideDiagnosisKeysWorker extends ListenableWorker {
       cal1.setTime(new Date(dailyActiveTrace));
 
       Calendar cal2 = Calendar.getInstance(); // now
+      long diffInMillies = Math.abs(cal1.getTimeInMillis() - cal2.getTimeInMillis());
+      long dayDiff = TimeUnit.DAYS.convert(diffInMillies, TimeUnit.MILLISECONDS);
 
-      boolean sameDay = cal1.get(Calendar.DAY_OF_YEAR) == cal2.get(Calendar.DAY_OF_YEAR) &&
-              cal1.get(Calendar.YEAR) == cal2.get(Calendar.YEAR);
-
-      if(dailyActiveTrace > 0 && sameDay) {
+      if(dayDiff == 0) {
         Events.raiseEvent(Events.INFO, "saveDailyMetric - already sent today");
         return;
       }
 
       Events.raiseEvent(Events.INFO, "saveDailyMetric - saving DAILY_ACTIVE_TRACE metric");
-      Fetcher.saveMetric("DAILY_ACTIVE_TRACE", this.getApplicationContext(), null);
-      SharedPrefs.setLong("dailyActiveTrace", System.currentTimeMillis(), this.getApplicationContext());
+      Fetcher.saveMetric("DAILY_ACTIVE_TRACE", this.context, null);
+      SharedPrefs.setLong("dailyActiveTrace", System.currentTimeMillis(), this.context);
 
     } catch(Exception ex) {
       Events.raiseError("saveDailyMetric - error", ex);
@@ -268,14 +316,11 @@ public class ProvideDiagnosisKeysWorker extends ListenableWorker {
   private Result processSuccess() {
     if(nextSince > 0) {
       Events.raiseEvent(Events.INFO, "success processing exports, setting since index to: " + nextSince);
-      SharedPrefs.setLong("since", nextSince, Tracing.currentContext);
+      SharedPrefs.setLong("since", nextSince, this.context);
 
       // try delete, does not affect success
       deleteExports();
     }
-
-    // try save daily metric, does not affect success
-    saveDailyMetric();
 
     return Result.success();
   }
@@ -298,7 +343,7 @@ public class ProvideDiagnosisKeysWorker extends ListenableWorker {
   public static void startScheduler() {
     long checkFrequency = SharedPrefs.getLong("exposureCheckFrequency", Tracing.context);
     if (checkFrequency <= 0) {
-      checkFrequency = 120;
+      checkFrequency = 180;
     }
     Events.raiseEvent(Events.INFO, "ProvideDiagnosisKeysWorker.startScheduler: run every " +
             checkFrequency + " minutes");
@@ -314,18 +359,27 @@ public class ProvideDiagnosisKeysWorker extends ListenableWorker {
                             .setRequiredNetworkType(NetworkType.CONNECTED)
                             .build())
             .build();
+    long scheduledCheckFrequency = SharedPrefs.getLong("scheduledExposureCheckFrequency", Tracing.context);
+    ExistingPeriodicWorkPolicy policy = scheduledCheckFrequency == 0 || checkFrequency != scheduledCheckFrequency
+            ? ExistingPeriodicWorkPolicy.REPLACE
+            : ExistingPeriodicWorkPolicy.KEEP;
     workManager
-            .enqueueUniquePeriodicWork(WORKER_NAME, ExistingPeriodicWorkPolicy.REPLACE, workRequest);
+            .enqueueUniquePeriodicWork(WORKER_NAME, policy, workRequest);
+    SharedPrefs.setLong("scheduledExposureCheckFrequency", checkFrequency, Tracing.context);
+    Events.raiseEvent(Events.INFO, "ProvideDiagnosisKeysWorker.startScheduler: policy " + policy);
   }
 
 
-  public static void startOneTimeWorkRequest() {
+  public static void startOneTimeWorkRequest(Boolean skipTimeCheck) {
     Events.raiseEvent(Events.INFO, "ProvideDiagnosisKeysWorker.startOneTimeWorker");
     WorkManager workManager = WorkManager.getInstance(Tracing.context);
     OneTimeWorkRequest workRequest = new OneTimeWorkRequest.Builder(ProvideDiagnosisKeysWorker.class)
             .setConstraints(
                     new Constraints.Builder()
                             .setRequiredNetworkType(NetworkType.CONNECTED)
+                            .build())
+            .setInputData(
+                    new Data.Builder().putBoolean("skipTimeCheck", skipTimeCheck)
                             .build())
             .build();
     workManager.enqueueUniqueWork("OneTimeWorker", ExistingWorkPolicy.REPLACE, workRequest);
@@ -337,6 +391,4 @@ public class ProvideDiagnosisKeysWorker extends ListenableWorker {
   }
 
   private static class NotEnabledException extends Exception {}
-  private static class ConfigNotSetException extends Exception {}
-  private static class ENSPaused extends Exception {}
 }

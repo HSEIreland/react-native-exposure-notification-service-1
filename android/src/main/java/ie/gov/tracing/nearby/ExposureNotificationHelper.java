@@ -5,8 +5,6 @@ import ie.gov.tracing.common.Events;
 import ie.gov.tracing.Tracing;
 import ie.gov.tracing.common.AppExecutors;
 import ie.gov.tracing.common.TaskToFutureAdapter;
-import com.google.android.gms.common.GoogleApiAvailability;
-import com.google.android.gms.nearby.Nearby;
 import com.google.common.util.concurrent.FluentFuture;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
@@ -88,7 +86,7 @@ public class ExposureNotificationHelper implements LifecycleObserver {
             }, MoreExecutors.directExecutor());
   }
 
-  private static ListenableFuture<Boolean> isEnabled() {
+  public static ListenableFuture<Boolean> isEnabled() {
     return TaskToFutureAdapter.getFutureWithTimeout(
         ExposureNotificationClientWrapper.get(Tracing.reactContext).isEnabled(),
         API_TIMEOUT.toMillis(),
@@ -112,13 +110,11 @@ public class ExposureNotificationHelper implements LifecycleObserver {
         AppExecutors.getScheduledExecutor());
   }
 
-    public static ListenableFuture<Void> checkAvailability() {
-        GoogleApiAvailability gps = GoogleApiAvailability.getInstance();
-
-        return TaskToFutureAdapter.getFutureWithTimeout(
-                gps.checkApiAvailability(Nearby.getExposureNotificationClient(Tracing.reactContext)),
-                API_TIMEOUT.toMillis(),
-                TimeUnit.MILLISECONDS,
-                AppExecutors.getScheduledExecutor());
-    }
+  public static ListenableFuture<Long> getDeviceENSVersion() {
+    return TaskToFutureAdapter.getFutureWithTimeout(
+            ExposureNotificationClientWrapper.get(Tracing.reactContext).getDeviceENSVersion(),
+            API_TIMEOUT.toMillis(),
+            TimeUnit.MILLISECONDS,
+            AppExecutors.getScheduledExecutor());
+  }
 }
